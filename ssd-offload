@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# ssd-offload: move folders from the internal disk to an external SSD and leave
+# a symlink behind, and move them back again later.
+#
+#   ssd-offload move    [-n] [-y] PATH...   copy PATH to the SSD, replace it with a symlink
+#   ssd-offload restore [-n] [-y] [--no-data] [--keep-ssd-copy] PATH...
+#                                           undo a move (see below)
+#   ssd-offload status                      list offloaded folders and whether the SSD is reachable
+#
+# restore (default): copy data back from the SSD, replace the symlink with the
+#                    real folder, delete the SSD copy.
+# restore --keep-ssd-copy: same, but leave the SSD copy in place.
+# restore --no-data: only delete the symlink and create an empty folder in its
+#                    place. The data stays on the SSD (useful for caches).
+#
+# -n  dry run (print what would happen)    -y  do not ask for confirmation
+#
+# Environment overrides:
+#   SSD_MOUNT   (default /Volumes/SSD)
+#   DEST_ROOT   (default $SSD_MOUNT/mac-offload)   data lives at DEST_ROOT/<path relative to $HOME>
+#   MANIFEST    (default ~/.config/ssd-offload/manifest)
+
+set -euo pipefail
+
+SSD_MOUNT="${SSD_MOUNT:-/Volumes/SSD}"
+DEST_ROOT="${DEST_ROOT:-$SSD_MOUNT/mac-offload}"
+MANIFEST="${MANIFEST:-$HOME/.config/ssd-offload/manifest}"
+HOME_REAL="$(cd "$HOME" && pwd -P)"
+
+DRY=0
+YES=0
+NODATA=0
+KEEP=0
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+require_ssd() {
+  if [ "${OFFLOAD_SKIP_MOUNT_CHECK:-0}" != "1" ]; then
+    mount | grep -q " on $SSD_MOUNT (" || die "$SSD_MOUNT is not mounted"
+  fi
+  mkdir -p "$DEST_ROOT" || die "cannot create $DEST_ROOT"
+  [ -w "$DEST_ROOT" ] || die "$DEST_ROOT is not writable"
+}
+
+# Absolute path with the parent resolved but the last component left alone
+# (so a symlink is not followed).
+abs_path() {
+  local p="${1%/}" d b
+  d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || die "no such directory for: $1"
+  b="$(basename "$p")"
+  printf '%s/%s\n' "$d" "$b"
+}
+
+size_kb() { du -sk "$1" | cut -f1; }
+
+avail_kb() { df -k -P "$1" | awk 'NR==2 {print $4}'; }
+
+entry_count() { find "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+byte_total() {
+  find "$1" -type f -exec stat -f %z {} + 2>/dev/null | awk '{s+=$1} END {print s+0}'
+}
+
+verify_copy() { # src dst
+  local a b c d
+  a="$(entry_count "$1")"; b="$(entry_count "$2")"
+  c="$(byte_total "$1")";  d="$(byte_total "$2")"
+  if [ "$a" != "$b" ] || [ "$c" != "$d" ]; then
+    say "  entries: $a vs $b, bytes: $c vs $d"
+    return 1
+  fi
+}
+
+confirm() {
+  [ "$YES" = "1" ] && return 0
+  local ans
+  read -r -p "Proceed? [y/N] " ans
+  case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+manifest_add() {
+  mkdir -p "$(dirname "$MANIFEST")"
+  touch "$MANIFEST"
+  grep -qxF "$1" "$MANIFEST" || printf '%s\n' "$1" >> "$MANIFEST"
+}
+
+manifest_remove() {
+  [ -f "$MANIFEST" ] || return 0
+  local tmp="$MANIFEST.tmp"
+  grep -vxF "$1" "$MANIFEST" > "$tmp" || true
+  mv "$tmp" "$MANIFEST"
+}
+
+check_allowed() { # abs path
+  case "$1" in
+    "$HOME_REAL"/*) ;;
+    *) die "refusing: $1 is not inside $HOME_REAL" ;;
+  esac
+  case "$1" in
+    "$HOME_REAL/Library" | "$HOME_REAL/Library/Application Support" | \
+    "$HOME_REAL/Library/Keychains" | "$HOME_REAL/Library/Preferences" | \
+    "$HOME_REAL/Library/Containers" | "$HOME_REAL/Library/Group Containers" | \
+    "$HOME_REAL/Desktop" | "$HOME_REAL/Documents" | "$HOME_REAL/.ssh" | \
+    "$HOME_REAL/.config/ssd-offload" | "$HOME_REAL/.local" | "$HOME_REAL/.local/bin")
+      die "refusing: $1 is a protected folder (move a subfolder instead)" ;;
+  esac
+}
+
+move_one() {
+  local abs rel dest old kb avail
+  abs="$(abs_path "$1")"
+  check_allowed "$abs"
+  if [ -L "$abs" ]; then say "skip (already a symlink): $abs"; return 0; fi
+  [ -d "$abs" ] || die "not a directory: $abs"
+
+  rel="${abs#"$HOME_REAL"/}"
+  dest="$DEST_ROOT/$rel"
+  [ -e "$dest" ] && die "destination already exists: $dest"
+
+  kb="$(size_kb "$abs")"
+  avail="$(avail_kb "$DEST_ROOT")"
+  [ "$avail" -gt "$kb" ] || die "not enough space on the SSD ($avail KB free, $kb KB needed)"
+
+  say "move: $abs ($((kb / 1024)) MB)"
+  say "  -> $dest (symlink left at original path)"
+  [ "$DRY" = "1" ] && return 0
+  say "  make sure no app is using this folder."
+  confirm || { say "  skipped"; return 0; }
+
+  mkdir -p "$(dirname "$dest")"
+  if ! ditto "$abs" "$dest"; then
+    rm -rf "$dest"
+    die "copy failed, original untouched: $abs"
+  fi
+  if ! verify_copy "$abs" "$dest"; then
+    rm -rf "$dest"
+    die "copy verification failed, original untouched: $abs"
+  fi
+
+  old="$abs.offload-old"
+  [ -e "$old" ] && die "leftover $old exists, remove it first"
+  if ! mv "$abs" "$old"; then
+    rm -rf "$dest"
+    die "cannot rename $abs (macOS-protected folder? grant the terminal Full Disk Access). Original untouched, SSD copy removed."
+  fi
+  ln -s "$dest" "$abs"
+  if [ ! -d "$abs" ]; then
+    rm -f "$abs"
+    mv "$old" "$abs"
+    die "symlink check failed, original restored: $abs"
+  fi
+  rm -rf "$old"
+  manifest_add "$abs"
+  say "  done"
+}
+
+restore_one() {
+  local abs target kb avail tmp parent
+  abs="$(abs_path "$1")"
+  [ -L "$abs" ] || die "not a symlink: $abs"
+  target="$(readlink "$abs")"
+  case "$target" in
+    "$DEST_ROOT"/*) ;;
+    *) die "symlink does not point into $DEST_ROOT: $abs -> $target" ;;
+  esac
+
+  if [ "$NODATA" = "1" ]; then
+    say "unlink: $abs (SSD data stays at $target)"
+    [ "$DRY" = "1" ] && return 0
+    confirm || { say "  skipped"; return 0; }
+    rm "$abs"
+    mkdir "$abs"
+    manifest_remove "$abs"
+    say "  done (empty folder created)"
+    return 0
+  fi
+
+  [ -d "$target" ] || die "data not reachable (is the SSD mounted?): $target"
+  kb="$(size_kb "$target")"
+  avail="$(avail_kb "$(dirname "$abs")")"
+  [ "$avail" -gt "$kb" ] || die "not enough internal space ($avail KB free, $kb KB needed)"
+
+  say "restore: $target ($((kb / 1024)) MB) -> $abs"
+  [ "$KEEP" = "1" ] && say "  SSD copy will be kept"
+  [ "$DRY" = "1" ] && return 0
+  say "  make sure no app is using this folder."
+  confirm || { say "  skipped"; return 0; }
+
+  tmp="$abs.restoring"
+  [ -e "$tmp" ] && die "leftover $tmp exists, remove it first"
+  if ! ditto "$target" "$tmp"; then
+    rm -rf "$tmp"
+    die "copy failed, symlink untouched: $abs"
+  fi
+  if ! verify_copy "$target" "$tmp"; then
+    rm -rf "$tmp"
+    die "copy verification failed, symlink untouched: $abs"
+  fi
+  rm "$abs"
+  mv "$tmp" "$abs"
+  if [ "$KEEP" != "1" ]; then
+    rm -rf "$target"
+    parent="$(dirname "$target")"
+    while [ "$parent" != "$DEST_ROOT" ] && [ "$parent" != "/" ]; do
+      rmdir "$parent" 2>/dev/null || break
+      parent="$(dirname "$parent")"
+    done
+  fi
+  manifest_remove "$abs"
+  say "  done"
+}
+
+status() {
+  local p t kb
+  if [ ! -s "$MANIFEST" ]; then say "nothing offloaded (manifest: $MANIFEST)"; return 0; fi
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ ! -L "$p" ]; then say "MISSING SYMLINK  $p"; continue; fi
+    t="$(readlink "$p")"
+    if [ -d "$t" ]; then
+      kb="$(size_kb "$t")"
+      printf 'ok       %6d MB  %s -> %s\n' "$((kb / 1024))" "$p" "$t"
+    else
+      printf 'OFFLINE            %s -> %s\n' "$p" "$t"
+    fi
+  done < "$MANIFEST"
+}
+
+[ $# -ge 1 ] || usage 1
+cmd="$1"; shift
+paths=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    --no-data) NODATA=1 ;;
+    --keep-ssd-copy) KEEP=1 ;;
+    -h|--help) usage 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) paths+=("$1") ;;
+  esac
+  shift
+done
+
+case "$cmd" in
+  move)
+    [ ${#paths[@]} -gt 0 ] || usage 1
+    require_ssd
+    for p in "${paths[@]}"; do move_one "$p"; done ;;
+  restore)
+    [ ${#paths[@]} -gt 0 ] || usage 1
+    for p in "${paths[@]}"; do restore_one "$p"; done ;;
+  status) status ;;
+  -h|--help|help) usage 0 ;;
+  *) usage 1 ;;
+esac
