@@ -2,10 +2,16 @@
 # ssd-offload: move folders from the internal disk to an external SSD and leave
 # a symlink behind, and move them back again later.
 #
-#   ssd-offload move    [-n] [-y] PATH...   copy PATH to the SSD, replace it with a symlink
-#   ssd-offload restore [-n] [-y] [--no-data] [--keep-ssd-copy] PATH...
-#                                           undo a move (see below)
-#   ssd-offload status                      list offloaded folders and whether the SSD is reachable
+#   ssd-offload move      [-n] [-y] PATH...  copy PATH to the SSD, replace it with a symlink
+#   ssd-offload move-list [-n] [-y]          move every folder in offload-list.txt
+#   ssd-offload restore   [-n] [-y] [--no-data] [--keep-ssd-copy] PATH...
+#                                            undo a move (see below)
+#   ssd-offload status                       list offloaded folders and whether the SSD is reachable
+#
+# The batch list lives next to this script: offload-list.txt. Edit it to choose
+# which folders a new Mac should offload, then preview and run:
+#   ./ssd-offload move-list -n     dry run
+#   ./ssd-offload move-list        move each folder, asking per folder
 #
 # restore (default): copy data back from the SSD, replace the symlink with the
 #                    real folder, delete the SSD copy.
@@ -16,15 +22,19 @@
 # -n  dry run (print what would happen)    -y  do not ask for confirmation
 #
 # Environment overrides:
-#   SSD_MOUNT   (default /Volumes/SSD)
-#   DEST_ROOT   (default $SSD_MOUNT/mac-offload)   data lives at DEST_ROOT/<path relative to $HOME>
-#   MANIFEST    (default ~/.config/ssd-offload/manifest)
+#   SSD_MOUNT    (default /Volumes/SSD)
+#   DEST_ROOT    (default $SSD_MOUNT/mac-offload)   data lives at DEST_ROOT/<path relative to $HOME>
+#   MANIFEST     (default ~/.config/ssd-offload/manifest)
+#   OFFLOAD_LIST (default <script dir>/offload-list.txt)
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 
 SSD_MOUNT="${SSD_MOUNT:-/Volumes/SSD}"
 DEST_ROOT="${DEST_ROOT:-$SSD_MOUNT/mac-offload}"
 MANIFEST="${MANIFEST:-$HOME/.config/ssd-offload/manifest}"
+OFFLOAD_LIST="${OFFLOAD_LIST:-$SCRIPT_DIR/offload-list.txt}"
 HOME_REAL="$(cd "$HOME" && pwd -P)"
 
 DRY=0
@@ -35,7 +45,7 @@ KEEP=0
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 require_ssd() {
   if [ "${OFFLOAD_SKIP_MOUNT_CHECK:-0}" != "1" ]; then
@@ -157,6 +167,32 @@ move_one() {
   say "  done"
 }
 
+move_list() {
+  [ -f "$OFFLOAD_LIST" ] || die "list not found: $OFFLOAD_LIST"
+  local line entry abs failed=0
+  while IFS= read -r line <&3 || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    case "$line" in \#*) continue ;; esac
+    case "$line" in
+      /*) say "skip (not home-relative): $line"; continue ;;
+    esac
+    entry="${line#./}"
+    abs="$HOME_REAL/$entry"
+    if [ ! -e "$abs" ] && [ ! -L "$abs" ]; then
+      say "missing, skipped: $abs"
+      continue
+    fi
+    if ! ( move_one "$abs" ); then
+      say "failed, continuing: $abs"
+      failed=1
+    fi
+  done 3< "$OFFLOAD_LIST"
+  [ "$failed" = "0" ] || return 1
+}
+
 restore_one() {
   local abs target kb avail tmp parent
   abs="$(abs_path "$1")"
@@ -250,6 +286,10 @@ case "$cmd" in
     [ ${#paths[@]} -gt 0 ] || usage 1
     require_ssd
     for p in "${paths[@]}"; do move_one "$p"; done ;;
+  move-list|move_list)
+    [ ${#paths[@]} -eq 0 ] || die "move-list takes no paths (edit $OFFLOAD_LIST instead)"
+    require_ssd
+    move_list ;;
   restore)
     [ ${#paths[@]} -gt 0 ] || usage 1
     for p in "${paths[@]}"; do restore_one "$p"; done ;;
