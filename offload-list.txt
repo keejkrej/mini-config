@@ -1,0 +1,31 @@
+# offload-list.txt: folders that `ssd-offload move-list` should move to the SSD.
+#
+# One folder per line, written relative to your home folder (no leading slash,
+# no /Users/<name>). Blank lines and lines starting with # are ignored.
+#
+#   .cache                 -> ~/.cache
+#   Library/Caches/pnpm    -> ~/Library/Caches/pnpm
+#
+# Edit this list to match a new Mac, then preview and run:
+#
+#   ./ssd-offload move-list -n     # dry run: show what would move
+#   ./ssd-offload move-list        # move each folder, asking per folder
+#   ./ssd-offload move-list -y     # move without asking
+#
+# Folders that do not exist on this Mac are reported and skipped. Folders that
+# are already symlinks are skipped, so re-running is safe. Use `ssd-offload
+# restore PATH` to move a folder back.
+
+.rustup
+.cargo
+.npm
+.cache
+.t3
+Library/pnpm
+Library/Caches/scriptc
+Library/Caches/pnpm
+Library/Caches/node-gyp
+Library/Caches/mise
+workspace
+.gemini/antigravity/worktrees
+Library/Caches/go-build
